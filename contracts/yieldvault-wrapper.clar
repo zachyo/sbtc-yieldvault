@@ -16,6 +16,10 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u2))
 (define-constant ERR_INVALID_AMOUNT (err u3))
 (define-constant ERR_CONTRACT_CALL_FAILED (err u4))
+(define-constant ERR_POSITION_NOT_FOUND (err u5))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u6))
+(define-constant ERR_LIQUIDATION_THRESHOLD (err u7))
+(define-constant ERR_PAUSED (err u8))
 
 ;; Contract addresses (placeholder addresses for MVP - will be updated with actual addresses)
 (define-constant HERMETICA_USDH_CONTRACT 'SP000000000000000000002Q6VF78.hermetica-usdh)
@@ -32,6 +36,9 @@
 
 ;; data vars
 (define-data-var contract-owner principal tx-sender)
+(define-data-var contract-paused bool false)
+(define-data-var total-sbtc-locked uint u0)
+(define-data-var total-usdh-minted uint u0)
 
 ;; data maps
 ;; Track user positions: collateral amount, minted USDh, last yield update block
@@ -54,12 +61,15 @@
     (new-usdh-total (+ (get usdh-minted current-position) usdh-amount))
     (collateral-ratio (calculate-collateral-ratio new-sbtc-total new-usdh-total))
   )
+    ;; Contract state validation
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+
     ;; Basic validation
     (asserts! (> sbtc-amount u0) ERR_INVALID_AMOUNT)
     (asserts! (> usdh-amount u0) ERR_INVALID_AMOUNT)
 
     ;; Check minimum collateral ratio (150%)
-    (asserts! (>= collateral-ratio MIN_COLLATERAL_RATIO) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (>= collateral-ratio MIN_COLLATERAL_RATIO) ERR_INSUFFICIENT_COLLATERAL)
 
     ;; Update yield before changing position
     (update-user-yield caller)
@@ -77,17 +87,30 @@
       last-yield-block: stacks-block-height
     })
 
-    ;; Emit event
+    ;; Update global totals
+    (var-set total-sbtc-locked (+ (var-get total-sbtc-locked) sbtc-amount))
+    (var-set total-usdh-minted (+ (var-get total-usdh-minted) usdh-amount))
+
+    ;; Emit enhanced event
     (print {
       action: "mint-usdh",
       user: caller,
       sbtc-amount: sbtc-amount,
       usdh-amount: usdh-amount,
-      new-collateral-ratio: collateral-ratio,
-      block-height: stacks-block-height
+      new-sbtc-total: new-sbtc-total,
+      new-usdh-total: new-usdh-total,
+      collateral-ratio: collateral-ratio,
+      total-sbtc-locked: (var-get total-sbtc-locked),
+      total-usdh-minted: (var-get total-usdh-minted),
+      block-height: stacks-block-height,
+      timestamp: stacks-block-height
     })
 
-    (ok true)
+    (ok {
+      sbtc-deposited: sbtc-amount,
+      usdh-minted: usdh-amount,
+      collateral-ratio: collateral-ratio
+    })
   )
 )
 
@@ -102,8 +125,12 @@
     (new-usdh-total (- current-usdh usdh-amount))
     (new-sbtc-total (- current-sbtc sbtc-to-return))
   )
+    ;; Contract state validation
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+
     ;; Basic validation
     (asserts! (> usdh-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> current-usdh u0) ERR_POSITION_NOT_FOUND)
     (asserts! (<= usdh-amount current-usdh) ERR_INSUFFICIENT_BALANCE)
 
     ;; Update yield before changing position
@@ -127,16 +154,29 @@
       })
     )
 
-    ;; Emit event
+    ;; Update global totals
+    (var-set total-sbtc-locked (- (var-get total-sbtc-locked) sbtc-to-return))
+    (var-set total-usdh-minted (- (var-get total-usdh-minted) usdh-amount))
+
+    ;; Emit enhanced event
     (print {
       action: "redeem-usdh",
       user: caller,
       usdh-amount: usdh-amount,
       sbtc-returned: sbtc-to-return,
-      block-height: stacks-block-height
+      new-sbtc-total: new-sbtc-total,
+      new-usdh-total: new-usdh-total,
+      total-sbtc-locked: (var-get total-sbtc-locked),
+      total-usdh-minted: (var-get total-usdh-minted),
+      block-height: stacks-block-height,
+      timestamp: stacks-block-height
     })
 
-    (ok sbtc-to-return)
+    (ok {
+      sbtc-returned: sbtc-to-return,
+      remaining-collateral: new-sbtc-total,
+      remaining-debt: new-usdh-total
+    })
   )
 )
 
@@ -164,6 +204,37 @@
     })
 
     (ok pending-yield)
+  )
+)
+
+;; Admin functions
+;; Pause/unpause contract
+(define-public (set-contract-paused (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused paused)
+    (print {
+      action: "contract-paused-changed",
+      admin: tx-sender,
+      paused: paused,
+      block-height: stacks-block-height
+    })
+    (ok paused)
+  )
+)
+
+;; Transfer ownership
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set contract-owner new-owner)
+    (print {
+      action: "ownership-transferred",
+      old-owner: tx-sender,
+      new-owner: new-owner,
+      block-height: stacks-block-height
+    })
+    (ok new-owner)
   )
 )
 
@@ -211,6 +282,43 @@
   )
     (merge position {pending-yield: pending-yield})
   )
+)
+
+;; Get contract statistics
+(define-read-only (get-contract-stats)
+  {
+    total-sbtc-locked: (var-get total-sbtc-locked),
+    total-usdh-minted: (var-get total-usdh-minted),
+    contract-paused: (var-get contract-paused),
+    contract-owner: (var-get contract-owner),
+    min-collateral-ratio: MIN_COLLATERAL_RATIO,
+    annual-yield-rate: ANNUAL_YIELD_RATE,
+    blocks-per-year: BLOCKS_PER_YEAR,
+    current-block: stacks-block-height
+  }
+)
+
+;; Check if user position is healthy (above liquidation threshold)
+(define-read-only (is-position-healthy (user principal))
+  (let (
+    (position (get-user-position user))
+    (collateral-ratio (get-collateral-ratio user))
+  )
+    (if (is-eq (get usdh-minted position) u0)
+      true
+      (>= collateral-ratio MIN_COLLATERAL_RATIO)
+    )
+  )
+)
+
+;; Get contract version info
+(define-read-only (get-contract-info)
+  {
+    name: "sBTC YieldVault",
+    version: "1.0.0",
+    description: "Wrapper contract for Hermetica's USDh stablecoin enabling sBTC as collateral",
+    target-apy: "25%"
+  }
 )
 
 ;; private functions
