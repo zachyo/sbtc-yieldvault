@@ -16,6 +16,10 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u2))
 (define-constant ERR_INVALID_AMOUNT (err u3))
 (define-constant ERR_CONTRACT_CALL_FAILED (err u4))
+(define-constant ERR_POSITION_NOT_FOUND (err u5))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u6))
+(define-constant ERR_LIQUIDATION_THRESHOLD (err u7))
+(define-constant ERR_PAUSED (err u8))
 
 ;; Contract addresses (placeholder addresses for MVP - will be updated with actual addresses)
 (define-constant HERMETICA_USDH_CONTRACT 'SP000000000000000000002Q6VF78.hermetica-usdh)
@@ -24,8 +28,17 @@
 ;; Minimum collateral ratio (150% = 15000 basis points)
 (define-constant MIN_COLLATERAL_RATIO u15000)
 
+;; Yield parameters (targeting 25% APY)
+;; Blocks per year on Stacks (approximately 52,560 blocks assuming 10 min block time)
+(define-constant BLOCKS_PER_YEAR u52560)
+;; Yield rate: 25% APY = 2500 basis points
+(define-constant ANNUAL_YIELD_RATE u2500)
+
 ;; data vars
 (define-data-var contract-owner principal tx-sender)
+(define-data-var contract-paused bool false)
+(define-data-var total-sbtc-locked uint u0)
+(define-data-var total-usdh-minted uint u0)
 
 ;; data maps
 ;; Track user positions: collateral amount, minted USDh, last yield update block
@@ -41,19 +54,187 @@
 ;; public functions
 ;; Mint USDh using sBTC as collateral
 (define-public (mint-usdh (sbtc-amount uint) (usdh-amount uint))
-  (begin
+  (let (
+    (caller tx-sender)
+    (current-position (get-user-position caller))
+    (new-sbtc-total (+ (get sbtc-collateral current-position) sbtc-amount))
+    (new-usdh-total (+ (get usdh-minted current-position) usdh-amount))
+    (collateral-ratio (calculate-collateral-ratio new-sbtc-total new-usdh-total))
+  )
+    ;; Contract state validation
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+
     ;; Basic validation
     (asserts! (> sbtc-amount u0) ERR_INVALID_AMOUNT)
     (asserts! (> usdh-amount u0) ERR_INVALID_AMOUNT)
 
-    ;; TODO: Implement collateral ratio check
-    ;; TODO: Transfer sBTC from user to contract
-    ;; TODO: Call Hermetica's mint function
-    ;; TODO: Update user position
+    ;; Check minimum collateral ratio (150%)
+    (asserts! (>= collateral-ratio MIN_COLLATERAL_RATIO) ERR_INSUFFICIENT_COLLATERAL)
 
-    ;; Placeholder implementation for Phase 1
-    (print {action: "mint-usdh", sbtc-amount: sbtc-amount, usdh-amount: usdh-amount, caller: tx-sender})
-    (ok true)
+    ;; Update yield before changing position
+    (update-user-yield caller)
+
+    ;; TODO: Transfer sBTC from user to contract (placeholder for actual sBTC contract call)
+    ;; (try! (contract-call? .sbtc-token transfer sbtc-amount caller (as-contract tx-sender) none))
+
+    ;; TODO: Call Hermetica's mint function (placeholder for actual Hermetica contract call)
+    ;; (try! (contract-call? .hermetica-usdh mint usdh-amount caller))
+
+    ;; Update user position
+    (map-set user-positions caller {
+      sbtc-collateral: new-sbtc-total,
+      usdh-minted: new-usdh-total,
+      last-yield-block: stacks-block-height
+    })
+
+    ;; Update global totals
+    (var-set total-sbtc-locked (+ (var-get total-sbtc-locked) sbtc-amount))
+    (var-set total-usdh-minted (+ (var-get total-usdh-minted) usdh-amount))
+
+    ;; Emit enhanced event
+    (print {
+      action: "mint-usdh",
+      user: caller,
+      sbtc-amount: sbtc-amount,
+      usdh-amount: usdh-amount,
+      new-sbtc-total: new-sbtc-total,
+      new-usdh-total: new-usdh-total,
+      collateral-ratio: collateral-ratio,
+      total-sbtc-locked: (var-get total-sbtc-locked),
+      total-usdh-minted: (var-get total-usdh-minted),
+      block-height: stacks-block-height,
+      timestamp: stacks-block-height
+    })
+
+    (ok {
+      sbtc-deposited: sbtc-amount,
+      usdh-minted: usdh-amount,
+      collateral-ratio: collateral-ratio
+    })
+  )
+)
+
+;; Redeem USDh and get back sBTC collateral plus yield
+(define-public (redeem-usdh (usdh-amount uint))
+  (let (
+    (caller tx-sender)
+    (current-position (get-user-position caller))
+    (current-usdh (get usdh-minted current-position))
+    (current-sbtc (get sbtc-collateral current-position))
+    (sbtc-to-return (/ (* current-sbtc usdh-amount) current-usdh))
+    (new-usdh-total (- current-usdh usdh-amount))
+    (new-sbtc-total (- current-sbtc sbtc-to-return))
+  )
+    ;; Contract state validation
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+
+    ;; Basic validation
+    (asserts! (> usdh-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> current-usdh u0) ERR_POSITION_NOT_FOUND)
+    (asserts! (<= usdh-amount current-usdh) ERR_INSUFFICIENT_BALANCE)
+
+    ;; Update yield before changing position
+    (update-user-yield caller)
+
+    ;; TODO: Burn USDh tokens (placeholder for actual Hermetica contract call)
+    ;; (try! (contract-call? .hermetica-usdh burn usdh-amount caller))
+
+    ;; TODO: Transfer sBTC back to user (placeholder for actual sBTC contract call)
+    ;; (try! (as-contract (contract-call? .sbtc-token transfer sbtc-to-return tx-sender caller none)))
+
+    ;; Update user position
+    (if (is-eq new-usdh-total u0)
+      ;; If fully redeemed, remove position
+      (map-delete user-positions caller)
+      ;; Otherwise update position
+      (map-set user-positions caller {
+        sbtc-collateral: new-sbtc-total,
+        usdh-minted: new-usdh-total,
+        last-yield-block: stacks-block-height
+      })
+    )
+
+    ;; Update global totals
+    (var-set total-sbtc-locked (- (var-get total-sbtc-locked) sbtc-to-return))
+    (var-set total-usdh-minted (- (var-get total-usdh-minted) usdh-amount))
+
+    ;; Emit enhanced event
+    (print {
+      action: "redeem-usdh",
+      user: caller,
+      usdh-amount: usdh-amount,
+      sbtc-returned: sbtc-to-return,
+      new-sbtc-total: new-sbtc-total,
+      new-usdh-total: new-usdh-total,
+      total-sbtc-locked: (var-get total-sbtc-locked),
+      total-usdh-minted: (var-get total-usdh-minted),
+      block-height: stacks-block-height,
+      timestamp: stacks-block-height
+    })
+
+    (ok {
+      sbtc-returned: sbtc-to-return,
+      remaining-collateral: new-sbtc-total,
+      remaining-debt: new-usdh-total
+    })
+  )
+)
+
+;; Claim accrued yield without redeeming collateral
+(define-public (claim-yield)
+  (let (
+    (caller tx-sender)
+    (pending-yield (get-pending-yield caller))
+  )
+    ;; Check if there's yield to claim
+    (asserts! (> pending-yield u0) ERR_INVALID_AMOUNT)
+
+    ;; Update user yield (this will add yield to USDh balance)
+    (update-user-yield caller)
+
+    ;; TODO: Mint additional USDh tokens for the yield (placeholder for actual Hermetica contract call)
+    ;; (try! (contract-call? .hermetica-usdh mint pending-yield caller))
+
+    ;; Emit event
+    (print {
+      action: "claim-yield",
+      user: caller,
+      yield-claimed: pending-yield,
+      block-height: stacks-block-height
+    })
+
+    (ok pending-yield)
+  )
+)
+
+;; Admin functions
+;; Pause/unpause contract
+(define-public (set-contract-paused (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused paused)
+    (print {
+      action: "contract-paused-changed",
+      admin: tx-sender,
+      paused: paused,
+      block-height: stacks-block-height
+    })
+    (ok paused)
+  )
+)
+
+;; Transfer ownership
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set contract-owner new-owner)
+    (print {
+      action: "ownership-transferred",
+      old-owner: tx-sender,
+      new-owner: new-owner,
+      block-height: stacks-block-height
+    })
+    (ok new-owner)
   )
 )
 
@@ -73,11 +254,111 @@
       u0
       ;; Simplified calculation: (collateral * 10000) / minted
       ;; In production, this would use price oracles
-      (/ (* (get sbtc-collateral position) u10000) (get usdh-minted position))
+      (calculate-collateral-ratio (get sbtc-collateral position) (get usdh-minted position))
     )
   )
 )
 
+;; Calculate pending yield for a user
+(define-read-only (get-pending-yield (user principal))
+  (let (
+    (position (get-user-position user))
+    (blocks-elapsed (- stacks-block-height (get last-yield-block position)))
+    (usdh-balance (get usdh-minted position))
+  )
+    (if (is-eq usdh-balance u0)
+      u0
+      ;; Calculate yield: (balance * yield_rate * blocks_elapsed) / (10000 * blocks_per_year)
+      (/ (* (* usdh-balance ANNUAL_YIELD_RATE) blocks-elapsed) (* u10000 BLOCKS_PER_YEAR))
+    )
+  )
+)
+
+;; Get user position with pending yield included
+(define-read-only (get-user-position-with-yield (user principal))
+  (let (
+    (position (get-user-position user))
+    (pending-yield (get-pending-yield user))
+  )
+    (merge position {pending-yield: pending-yield})
+  )
+)
+
+;; Get contract statistics
+(define-read-only (get-contract-stats)
+  {
+    total-sbtc-locked: (var-get total-sbtc-locked),
+    total-usdh-minted: (var-get total-usdh-minted),
+    contract-paused: (var-get contract-paused),
+    contract-owner: (var-get contract-owner),
+    min-collateral-ratio: MIN_COLLATERAL_RATIO,
+    annual-yield-rate: ANNUAL_YIELD_RATE,
+    blocks-per-year: BLOCKS_PER_YEAR,
+    current-block: stacks-block-height
+  }
+)
+
+;; Check if user position is healthy (above liquidation threshold)
+(define-read-only (is-position-healthy (user principal))
+  (let (
+    (position (get-user-position user))
+    (collateral-ratio (get-collateral-ratio user))
+  )
+    (if (is-eq (get usdh-minted position) u0)
+      true
+      (>= collateral-ratio MIN_COLLATERAL_RATIO)
+    )
+  )
+)
+
+;; Get contract version info
+(define-read-only (get-contract-info)
+  {
+    name: "sBTC YieldVault",
+    version: "1.0.0",
+    description: "Wrapper contract for Hermetica's USDh stablecoin enabling sBTC as collateral",
+    target-apy: "25%"
+  }
+)
+
 ;; private functions
-;;
+;; Update user yield by adding accrued yield to their USDh balance
+(define-private (update-user-yield (user principal))
+  (let (
+    (current-position (get-user-position user))
+    (pending-yield (get-pending-yield user))
+    (new-usdh-balance (+ (get usdh-minted current-position) pending-yield))
+  )
+    (if (> pending-yield u0)
+      (begin
+        ;; Update position with accrued yield
+        (map-set user-positions user {
+          sbtc-collateral: (get sbtc-collateral current-position),
+          usdh-minted: new-usdh-balance,
+          last-yield-block: stacks-block-height
+        })
+        ;; Emit yield event
+        (print {
+          action: "yield-accrued",
+          user: user,
+          yield-amount: pending-yield,
+          new-usdh-balance: new-usdh-balance,
+          block-height: stacks-block-height
+        })
+        true
+      )
+      true
+    )
+  )
+)
+
+;; Calculate collateral ratio given amounts
+(define-private (calculate-collateral-ratio (sbtc-amount uint) (usdh-amount uint))
+  (if (is-eq usdh-amount u0)
+    u0
+    ;; Assuming 1:1 price ratio for MVP (sbtc-amount * 10000) / usdh-amount
+    ;; In production, this would use price oracles
+    (/ (* sbtc-amount u10000) usdh-amount)
+  )
+)
 
